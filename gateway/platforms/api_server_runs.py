@@ -7,6 +7,7 @@ import logging
 import os
 import time
 import uuid
+from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -30,13 +31,12 @@ logger = logging.getLogger("gateway.platforms.api_server")
 _ROOM_RETENTION_REQUEST_KEY = (
     RequestKey("hermes.room_run_retention_until", float) if RequestKey is not None
     else "hermes.room_run_retention_until")
-# Forwarded subagent lifecycle fields; free-text ones are secret-redacted.
-_SUBAGENT_EVENT_KEYS = (
-    "goal", "task_count", "task_index", "subagent_id", "child_session_id", "delegation_id", "parent_id",
-    "depth", "model", "tool_count", "status", "summary", "duration_seconds", "input_tokens",
-    "output_tokens", "reasoning_tokens", "api_calls", "cost_usd", "files_read", "files_written",
-    "output_tail")
-_SUBAGENT_TEXT_KEYS = ("goal", "summary", "output_tail")
+_SUBAGENT_LIFECYCLE_EVENTS = {
+    "subagent.spawn_requested", "subagent.start", "subagent.progress", "subagent.tool", "subagent.complete"}
+_SUBAGENT_ID_KEYS = ("subagent_id", "parent_id", "delegation_id")
+_SUBAGENT_STATUS_VALUES = {"queued", "started", "running", "working", "stopping", "completed", "failed"}
+_SUBAGENT_TOOL_NAMES = {
+    "apply_patch", "browser_navigate", "edit_file", "read_file", "shell", "terminal", "web_search", "write_file"}
 # Terminal usage payload: (wire key, agent attribute), in wire order. Cache reads ride along so a
 # cost poller does not book them as full-price input (#102101).
 _USAGE_FIELDS = (
@@ -50,6 +50,21 @@ _FIXED_EVENT_FIELDS = {
         "tool": tool, "duration": round(kw.get("duration", 0), 3), "error": kw.get("is_error", False)},
     "reasoning.available": lambda tool, preview, kw: {"text": preview or ""}}
 _TOOL_COMPLETED_PREVIEW_MAX_CHARS = 500
+_RUN_EVENT_JOURNAL_MAX_EVENTS = 1000
+_LAST_EVENT_ID_MAX_DIGITS = 20
+
+
+def _parse_last_event_id(value: Any) -> int:
+    """Return a safe replay cursor, treating invalid client input as a fresh stream."""
+    if not isinstance(value, str) or not value:
+        return 0
+    if len(value) > _LAST_EVENT_ID_MAX_DIGITS:
+        return 0
+    if value != "0" and value.startswith("0"):
+        return 0
+    if not value.isascii() or not value.isdecimal():
+        return 0
+    return int(value)
 
 
 def _tool_completed_preview(result: Any, redact_sensitive_text: Callable[..., str]) -> str:
@@ -61,6 +76,36 @@ def _tool_completed_preview(result: Any, redact_sensitive_text: Callable[..., st
     preview = redact_sensitive_text(text, force=True)
     limit = _TOOL_COMPLETED_PREVIEW_MAX_CHARS
     return preview if len(preview) <= limit else preview[: limit - 3] + "..."
+
+
+def _safe_subagent_event_fields(tool_name: Any, fields: Dict[str, Any]) -> Dict[str, Any]:
+    """Select bounded lifecycle metadata; child prompts, transcripts, output, and usage never enter SSE."""
+    safe: Dict[str, Any] = {}
+    for key in _SUBAGENT_ID_KEYS:
+        value = fields.get(key)
+        if isinstance(value, str) and value:
+            safe[key] = value[:256]
+    for key, minimum, maximum in (
+        ("task_index", 0, 9_999), ("task_count", 1, 10_000), ("depth", 0, 8),
+        ("tool_count", 0, 100_000)):
+        value = fields.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            safe[key] = min(maximum, max(minimum, int(value)))
+    model = fields.get("model")
+    if isinstance(model, str):
+        label = "".join(char for char in model.strip() if char.isalnum() or char in "._/+ -")[:80]
+        if label:
+            safe["model"] = label
+    status = fields.get("status")
+    if isinstance(status, str) and status.strip().lower() in _SUBAGENT_STATUS_VALUES:
+        safe["status"] = status.strip().lower()
+    duration = fields.get("duration_seconds")
+    if isinstance(duration, (int, float)) and not isinstance(duration, bool):
+        safe["duration_seconds"] = min(86_400.0, max(0.0, float(duration)))
+    normalized_tool = tool_name.strip().lower() if isinstance(tool_name, str) else ""
+    if normalized_tool in _SUBAGENT_TOOL_NAMES:
+        safe["tool_name"] = normalized_tool
+    return safe
 
 
 def _remember_room_retention(request: "web.Request", claims: dict[str, Any]) -> None:
@@ -82,6 +127,78 @@ def _room_retention_until(request: "web.Request") -> float:
 def _run_event(run_id: str, name: str, **fields: Any) -> Dict[str, Any]:
     """Build one SSE event payload (key order is part of the wire format)."""
     return {"event": name, "run_id": run_id, "timestamp": time.time(), **fields}
+
+
+@dataclass(frozen=True, slots=True)
+class _RunEventRecord:
+    event_id: int
+    event: Dict[str, Any]
+
+
+class _RunEventJournal:
+    """Bounded run history with an atomic replay-to-live subscriber handoff.
+
+    All methods run on the adapter's event loop. Producer callbacks from executor
+    threads schedule ``publish`` onto that loop before calling it.
+    """
+
+    def __init__(self, *, max_events: int):
+        if max_events < 1:
+            raise ValueError("max_events must be positive")
+        self._max_events = max_events
+        self._events = deque(maxlen=max_events)
+        self._subscribers: set[asyncio.Queue] = set()
+        self._next_id = 1
+        self._closed = False
+        self._closed_at: Optional[float] = None
+
+    @property
+    def has_subscribers(self) -> bool:
+        return bool(self._subscribers)
+
+    @property
+    def closed_at(self) -> Optional[float]:
+        return self._closed_at
+
+    def events_after(self, event_id: int) -> list[_RunEventRecord]:
+        return [record for record in self._events if record.event_id > event_id]
+
+    @staticmethod
+    def _enqueue(queue: asyncio.Queue, item: Optional[_RunEventRecord]) -> None:
+        if queue.full():
+            with suppress(asyncio.QueueEmpty):
+                queue.get_nowait()
+        queue.put_nowait(item)
+
+    def publish(self, event: Dict[str, Any]) -> int:
+        if self._closed:
+            raise RuntimeError("run event journal is closed")
+        record = _RunEventRecord(self._next_id, event)
+        self._next_id += 1
+        self._events.append(record)
+        for queue in tuple(self._subscribers):
+            self._enqueue(queue, record)
+        return record.event_id
+
+    def subscribe(self, *, after_id: int) -> asyncio.Queue:
+        queue: asyncio.Queue = asyncio.Queue(maxsize=self._max_events + 1)
+        self._subscribers.add(queue)
+        for record in self.events_after(after_id):
+            self._enqueue(queue, record)
+        if self._closed:
+            self._enqueue(queue, None)
+        return queue
+
+    def unsubscribe(self, queue: asyncio.Queue) -> None:
+        self._subscribers.discard(queue)
+
+    def close(self, *, now: Optional[float] = None) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._closed_at = time.time() if now is None else now
+        for queue in tuple(self._subscribers):
+            self._enqueue(queue, None)
 
 
 def terminal_run_status(result: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
@@ -123,7 +240,7 @@ def _initialize_run_state(self, *, store_factory) -> None:
         self._run_owner_started = int(get_process_start_time(self._run_owner_pid) or 0)
     except Exception:
         self._run_owner_started = 0
-    # All keyed by run_id: SSE queues (+creation time for the TTL sweep), connected
+    # All keyed by run_id: SSE journals (+creation time for the TTL sweep), connected
     # subscribers, live agent/task refs for cooperative stop (the executor thread may
     # outlive the request, hence the separate stopping set), pollable statuses, and
     # approval session keys (approval core resolves by session key, clients by run_id).
@@ -198,20 +315,19 @@ def _mark_shutdown_interrupted_runs(self, run_ids) -> None:
 
 
 def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop", *, _api_server):
-    """Return a callback that pushes structured events to the run SSE queue."""
+    """Return a callback that publishes structured events to the run SSE journal."""
     redact_sensitive_text = _api_server.redact_sensitive_text
 
     def _push(event: Dict[str, Any]) -> None:
         self._set_run_status(
             run_id, self._run_statuses.get(run_id, {}).get("status", "running"), last_event=event.get("event"))
-        q = self._run_streams.get(run_id)
-        if q is not None:
+        journal = self._run_streams.get(run_id)
+        if journal is not None:
             with suppress(Exception):
-                loop.call_soon_threadsafe(q.put_nowait, event)
+                loop.call_soon_threadsafe(journal.publish, event)
 
     def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
-        # _thinking / subagent.tool / subagent_progress are deliberately dropped (UI noise);
-        # lifecycle boundaries must land so clients can observe delegate_task failures.
+        # Child thinking/text are deliberately dropped: only structured lifecycle metadata is public.
         fields = _FIXED_EVENT_FIELDS.get(event_type)
         if fields is not None:
             event_fields = fields(tool_name, preview, kwargs)
@@ -219,17 +335,8 @@ def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop
                 event_fields["preview"] = _tool_completed_preview(
                     kwargs.get("result"), redact_sensitive_text)
             _push(_run_event(run_id, event_type, **event_fields))
-        elif event_type in {"subagent.start", "subagent.complete"}:
-            event = _run_event(run_id, event_type)
-            if preview is not None:
-                event["preview"] = redact_sensitive_text(str(preview), force=True)
-            for key in _SUBAGENT_EVENT_KEYS:
-                value = kwargs.get(key)
-                if value is not None:
-                    # Free text may carry child tool output: force secret redaction on this public stream.
-                    redact = key in _SUBAGENT_TEXT_KEYS and isinstance(value, str)
-                    event[key] = redact_sensitive_text(value, force=True) if redact else value
-            _push(event)
+        elif event_type in _SUBAGENT_LIFECYCLE_EVENTS:
+            _push(_run_event(run_id, event_type, **_safe_subagent_event_fields(tool_name, kwargs)))
 
     return _callback
 
@@ -369,7 +476,7 @@ class _RunLaunch:
 
     owner: Any
     run_id: str
-    queue: "asyncio.Queue[Optional[Dict]]"
+    queue: _RunEventJournal
     session_id: str
     gateway_session_key: Optional[str]
     declared_selected: bool
@@ -392,9 +499,12 @@ class _RunLaunch:
         return self.run_id
 
     def put_event(self, event: Optional[Dict]) -> None:
-        """Enqueue only while this run still owns live transport state."""
+        """Publish only while this run still owns live transport state."""
         if self.owner._run_streams.get(self.run_id) is self.queue:
-            self.queue.put_nowait(event)
+            if event is None:
+                self.queue.close()
+            else:
+                self.queue.publish(event)
 
 
 def _forget_run(self, run_id: str, *tables) -> None:
@@ -591,7 +701,7 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
     session_history_delivery = not previous_response_id and not conversation_history
     if not conversation_history and selected_session_id and not previous_response_id:
         conversation_history = await self._conversation_history_for_session(str(selected_session_id))
-    q = self._run_streams[run_id] = asyncio.Queue()
+    q = self._run_streams[run_id] = _RunEventJournal(max_events=_RUN_EVENT_JOURNAL_MAX_EVENTS)
     created_at = self._run_streams_created[run_id] = time.time()
     self._run_approval_sessions[run_id] = run_id  # approval session key (see _RunLaunch)
     initial_status = self._set_run_status(
@@ -719,7 +829,7 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
 
 def _make_approval_notify(self, run: _RunLaunch, *, _api_server) -> Callable[[Dict[str, Any]], None]:
     """Approval-request bridge: redact, stamp the event envelope, park the run status, enqueue."""
-    run_id, q, loop = run.run_id, run.queue, asyncio.get_running_loop()
+    run_id, journal, loop = run.run_id, run.queue, asyncio.get_running_loop()
 
     def _approval_notify(approval_data: Dict[str, Any]) -> None:
         event = dict(approval_data or {})
@@ -736,7 +846,7 @@ def _make_approval_notify(self, run: _RunLaunch, *, _api_server) -> Callable[[Di
             allow_permanent=event.get("allow_permanent") is not False)))
         self._set_run_status(run_id, "waiting_for_approval", last_event="approval.request", approval=event)
         with suppress(Exception):
-            loop.call_soon_threadsafe(q.put_nowait, event)
+            loop.call_soon_threadsafe(journal.publish, event)
 
     return _approval_notify
 
@@ -904,7 +1014,9 @@ async def _handle_run_events(self, request: "web.Request", *, _api_server) -> "w
         await asyncio.sleep(0.05)
     else:
         return _run_not_found(_api_server._openai_error, run_id)
-    q = self._run_streams[run_id]
+    journal = self._run_streams[run_id]
+    after_id = _parse_last_event_id(request.headers.get("Last-Event-ID"))
+    q = journal.subscribe(after_id=after_id)
     self._run_stream_subscribers.add(run_id)
     response = web.StreamResponse(status=200, headers={
         "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
@@ -920,22 +1032,23 @@ async def _handle_run_events(self, request: "web.Request", *, _api_server) -> "w
             if event is None:  # run finished
                 await response.write(b": stream closed\n\n")
                 break
-            await response.write(_api_server._sse_frame(event))
+            await response.write(
+                f"id: {event.event_id}\n".encode() + _api_server._sse_frame(event.event))
     except Exception as exc:
         logger.debug("[api_server] SSE stream error for run %s: %s", run_id, exc)
     finally:
+        journal.unsubscribe(q)
         self._run_stream_subscribers.discard(run_id)
-        _drop_run_transport(self, run_id)
     return response
 
 
 def _mark_run_event(self, run_id: str, name: str, **fields: Any) -> None:
     """Record a control-plane event on the run status and (best effort) its SSE stream."""
     self._set_run_status(run_id, "running", last_event=name)
-    q = self._run_streams.get(run_id)
-    if q is not None:
+    journal = self._run_streams.get(run_id)
+    if journal is not None:
         with suppress(Exception):
-            q.put_nowait(_run_event(run_id, name, **fields))
+            journal.publish(_run_event(run_id, name, **fields))
 
 
 _APPROVAL_CHOICE_ALIASES = {"approve": "once", "approved": "once", "allow": "once"}
@@ -1062,11 +1175,16 @@ def _sweep_orphaned_runs_once(self, now: Optional[float] = None) -> None:
     if now is None:
         now = time.time()
     for run_id, created_at in list(self._run_streams_created.items()):
-        if now - created_at <= self._RUN_STREAM_TTL or run_id in self._run_stream_subscribers:
+        journal = self._run_streams.get(run_id)
+        task = self._active_run_tasks.get(run_id)
+        if task is not None and not task.done():
+            continue
+        retention_started = journal.closed_at if journal is not None else None
+        expires_from = retention_started if retention_started is not None else created_at
+        if (now - expires_from <= self._RUN_STREAM_TTL
+                or (journal is not None and journal.has_subscribers)):
             continue
         logger.debug("[api_server] sweeping expired run transport %s", run_id)
-        task = self._active_run_tasks.get(run_id)
-        # Transport TTL bounds buffering; live control state survives until the task returns.
         _drop_run_transport(self, run_id)
         if task is None or task.done():
             _unregister_approval_notify(self._run_approval_sessions.get(run_id))

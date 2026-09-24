@@ -15,6 +15,7 @@ from gateway.platforms import api_server
 from gateway.platforms import api_server_openai_routes as routes
 from gateway.platforms.api_server import APIServerAdapter
 from gateway.platforms.api_server_openai_routes import _iter_stream_items
+from gateway.platforms.api_server_runs import _RunEventJournal
 
 REMOTE_CLIENT_IDLE_DEADLINE_S = 20.0
 
@@ -68,7 +69,7 @@ async def test_idle_openai_stream_writes_keepalive_before_remote_client_deadline
 async def test_idle_run_events_stream_uses_shared_keepalive_cadence(monkeypatch, adapter):
     """``GET /v1/runs/{id}/events`` follows the same keepalive constant as the OpenAI routes."""
     monkeypatch.setattr(api_server, "CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS", 0.2)
-    queue: asyncio.Queue = asyncio.Queue()
+    queue = _RunEventJournal(max_events=10)
     adapter._run_streams["run_idle"] = queue
     adapter._set_run_status("run_idle", "running")
     monkeypatch.setattr(adapter, "_request_owns_run", lambda request, run_id: True)
@@ -79,7 +80,7 @@ async def test_idle_run_events_stream_uses_shared_keepalive_cadence(monkeypatch,
 
     async def _close_after_idle():
         await asyncio.sleep(0.5)
-        await queue.put(None)
+        queue.close()
 
     async with TestClient(TestServer(app)) as cli:
         closer = asyncio.create_task(_close_after_idle())

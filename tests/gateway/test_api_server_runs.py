@@ -11,6 +11,7 @@ Covers:
 
 import asyncio
 import hashlib
+import json
 import threading
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -27,6 +28,7 @@ from gateway.platforms.api_server import (
     cors_middleware,
     security_headers_middleware,
 )
+from gateway.platforms.api_server_runs import _RunEventJournal, _parse_last_event_id
 from tools import approval as approval_mod
 from tools import approval_gateway_wait
 
@@ -493,10 +495,185 @@ class TestRunStatus:
 
 
 class TestRunEvents:
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (None, 0),
+            ("", 0),
+            ("0", 0),
+            ("42", 42),
+            ("02", 0),
+            ("-1", 0),
+            ("1.5", 0),
+            ("not-a-cursor", 0),
+            ("9" * 10_000, 0),
+        ],
+    )
+    def test_last_event_id_accepts_only_bounded_canonical_decimal(self, value, expected):
+        assert _parse_last_event_id(value) == expected
+
+    @pytest.mark.asyncio
+    async def test_event_journal_bounds_history_and_closes_replay_live_race(self):
+        journal = _RunEventJournal(max_events=2)
+
+        assert journal.publish({"event": "message.delta", "delta": "one"}) == 1
+        assert journal.publish({"event": "message.delta", "delta": "two"}) == 2
+        subscriber = journal.subscribe(after_id=1)
+        assert journal.publish({"event": "run.completed", "output": "done"}) == 3
+        journal.close()
+
+        delivered = []
+        while True:
+            record = await subscriber.get()
+            if record is None:
+                break
+            delivered.append(record)
+
+        assert [(record.event_id, record.event["event"]) for record in delivered] == [
+            (2, "message.delta"),
+            (3, "run.completed"),
+        ]
+        assert [record.event_id for record in journal.events_after(0)] == [2, 3]
+
+    @pytest.mark.asyncio
+    async def test_last_event_id_replays_terminal_suffix_with_sse_ids(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            def create_agent(**kwargs):
+                mock_agent = MagicMock()
+
+                def run_conversation(**_run_kwargs):
+                    kwargs["stream_delta_callback"]("one")
+                    kwargs["stream_delta_callback"]("two")
+                    return {"final_response": "done"}
+
+                mock_agent.run_conversation.side_effect = run_conversation
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                return mock_agent
+
+            with patch.object(adapter, "_create_agent", side_effect=create_agent):
+                response = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await response.json())["run_id"]
+                first_body = await (await cli.get(f"/v1/runs/{run_id}/events")).text()
+
+                first = []
+                for frame in first_body.split("\n\n"):
+                    lines = frame.splitlines()
+                    event_id = next((int(line[4:]) for line in lines if line.startswith("id: ")), None)
+                    data = next((json.loads(line[6:]) for line in lines if line.startswith("data: ")), None)
+                    if event_id is not None and data is not None:
+                        first.append((event_id, data["event"]))
+
+                replay_body = await (await cli.get(
+                    f"/v1/runs/{run_id}/events", headers={"Last-Event-ID": str(first[0][0])}
+                )).text()
+                replay = []
+                for frame in replay_body.split("\n\n"):
+                    lines = frame.splitlines()
+                    event_id = next((int(line[4:]) for line in lines if line.startswith("id: ")), None)
+                    data = next((json.loads(line[6:]) for line in lines if line.startswith("data: ")), None)
+                    if event_id is not None and data is not None:
+                        replay.append((event_id, data["event"]))
+
+        assert len(first) >= 3
+        assert [event_id for event_id, _ in first] == sorted({event_id for event_id, _ in first})
+        assert first[-1][1] == "run.completed"
+        assert replay == first[1:]
+        assert run_id in adapter._run_streams
+
+    @pytest.mark.asyncio
+    async def test_subscriber_disconnect_keeps_live_run_and_transport(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent, agent_ready, _ = _make_slow_agent()
+                mock_create.return_value = mock_agent
+                response = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await response.json())["run_id"]
+                assert agent_ready.wait(timeout=3.0)
+
+                events_response = await cli.get(f"/v1/runs/{run_id}/events")
+                events_response.close()
+                adapter._run_streams[run_id].publish({"event": "test.disconnect"})
+                for _ in range(40):
+                    if run_id not in adapter._run_stream_subscribers:
+                        break
+                    await asyncio.sleep(0.01)
+
+                assert not adapter._active_run_tasks[run_id].done()
+                assert run_id in adapter._run_streams
+
+                stop_response = await cli.post(f"/v1/runs/{run_id}/stop")
+                assert stop_response.status == 200
+
+    @pytest.mark.asyncio
+    async def test_disconnect_past_ttl_then_completion_replays_terminal_suffix(self, adapter):
+        ready = threading.Event()
+        finish = threading.Event()
+        app = _create_runs_app(adapter)
+
+        def create_agent(**callbacks):
+            mock_agent = MagicMock()
+
+            def run_conversation(**_kwargs):
+                callbacks["stream_delta_callback"]("before disconnect")
+                ready.set()
+                assert finish.wait(timeout=5)
+                callbacks["stream_delta_callback"]("after disconnect")
+                return {"final_response": "durable terminal"}
+
+            mock_agent.run_conversation.side_effect = run_conversation
+            mock_agent.session_prompt_tokens = 0
+            mock_agent.session_completion_tokens = 0
+            mock_agent.session_total_tokens = 0
+            return mock_agent
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", side_effect=create_agent):
+                response = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await response.json())["run_id"]
+                assert ready.wait(timeout=3)
+
+                first = await cli.get(f"/v1/runs/{run_id}/events")
+                first.close()
+                for _ in range(40):
+                    if run_id not in adapter._run_stream_subscribers:
+                        break
+                    await asyncio.sleep(0.01)
+
+                adapter._run_streams_created[run_id] -= adapter._RUN_STREAM_TTL + 1
+                adapter._sweep_orphaned_runs_once(time.time())
+                assert run_id in adapter._run_streams
+
+                finish.set()
+                for _ in range(80):
+                    if adapter._run_statuses.get(run_id, {}).get("status") == "completed":
+                        break
+                    await asyncio.sleep(0.025)
+
+                replay = await (
+                    await cli.get(
+                        f"/v1/runs/{run_id}/events",
+                        headers={"Last-Event-ID": "1"},
+                    )
+                ).text()
+
+        frames = [
+            json.loads(line[6:])
+            for line in replay.splitlines()
+            if line.startswith("data: ")
+        ]
+        assert [event["event"] for event in frames] == ["message.delta", "run.completed"]
+        assert frames[0]["delta"] == "after disconnect"
+        assert frames[1]["output"] == "durable terminal"
+
     @pytest.mark.asyncio
     async def test_tool_completed_event_includes_redacted_bounded_result_preview(self, adapter):
         loop = asyncio.get_running_loop()
-        adapter._run_streams["run_tool"] = asyncio.Queue()
+        adapter._run_streams["run_tool"] = _RunEventJournal(max_events=10)
+        subscriber = adapter._run_streams["run_tool"].subscribe(after_id=0)
         callback = adapter._make_run_event_callback("run_tool", loop)
 
         callback(
@@ -508,7 +685,7 @@ class TestRunEvents:
                 "output": "x" * 600,
             },
         )
-        event = await adapter._run_streams["run_tool"].get()
+        event = (await subscriber.get()).event
 
         assert event["error"] is True
         assert "BLOCKED: approval required" in event["preview"]
@@ -671,7 +848,8 @@ class TestSteerRun:
         app = _create_runs_app(adapter)
         agent = MagicMock()
         agent.steer.return_value = True
-        queue = asyncio.Queue()
+        queue = _RunEventJournal(max_events=10)
+        subscriber = queue.subscribe(after_id=0)
         adapter._active_run_agents["run_123"] = agent
         adapter._run_streams["run_123"] = queue
         adapter._set_run_status("run_123", "running")
@@ -689,7 +867,7 @@ class TestSteerRun:
         }
         agent.steer.assert_called_once_with("tighten the ending")
         assert adapter._run_statuses["run_123"]["last_event"] == "run.steered"
-        event = queue.get_nowait()
+        event = subscriber.get_nowait().event
         assert event["event"] == "run.steered"
         assert event["run_id"] == "run_123"
         assert event["accepted"] is True
@@ -871,8 +1049,8 @@ class TestSteerRun:
 class TestRunLifecycleSweep:
 
     @pytest.mark.asyncio
-    async def test_expired_live_run_drops_transport_but_keeps_control_state(self, adapter):
-        """Stream TTL bounds buffering without detaching a live run."""
+    async def test_expired_live_run_keeps_transport_and_control_state(self, adapter):
+        """Transport retention does not begin while the run task is active."""
         app = _create_runs_app(adapter)
         adapter._max_concurrent_runs = 1
 
@@ -909,8 +1087,8 @@ class TestRunLifecycleSweep:
 
                 assert adapter._active_run_tasks[run_id] is task
                 assert adapter._active_run_agents[run_id] is mock_agent
-                assert run_id not in adapter._run_streams
-                assert run_id not in adapter._run_streams_created
+                assert run_id in adapter._run_streams
+                assert run_id in adapter._run_streams_created
                 assert adapter._run_approval_sessions[run_id] == run_id
 
                 limited = adapter._concurrency_limited_response()
@@ -928,6 +1106,19 @@ class TestRunLifecycleSweep:
                 stop_resp = await cli.post(f"/v1/runs/{run_id}/stop")
                 assert stop_resp.status == 200
                 mock_agent.interrupt.assert_called_once_with("Stop requested via API")
+
+    def test_terminal_transport_ttl_begins_when_journal_closes(self, adapter):
+        run_id = "run_terminal_retention"
+        journal = _RunEventJournal(max_events=10)
+        adapter._run_streams[run_id] = journal
+        adapter._run_streams_created[run_id] = 1
+        journal.close(now=1_000)
+
+        adapter._sweep_orphaned_runs_once(1_000 + adapter._RUN_STREAM_TTL)
+        assert run_id in adapter._run_streams
+
+        adapter._sweep_orphaned_runs_once(1_001 + adapter._RUN_STREAM_TTL)
+        assert run_id not in adapter._run_streams
 
 
 # ---------------------------------------------------------------------------

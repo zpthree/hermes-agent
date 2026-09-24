@@ -41,6 +41,7 @@ from gateway.platforms.api_server import (
     cors_middleware,
     security_headers_middleware,
 )
+from gateway.platforms.api_server_runs import _RunEventJournal
 
 
 # ---------------------------------------------------------------------------
@@ -752,34 +753,48 @@ class TestDisconnectedAgentReap:
 class TestRunEventCallback:
 
     @pytest.mark.asyncio
-    async def test_subagent_events_redact_secrets_and_carry_child_session(self, adapter):
-        """Free-text fields (goal/summary/output_tail/preview) must pass the
-        forced secret redaction before hitting the public /v1/runs stream,
-        and child_session_id must survive the allowlist so clients can
-        correlate the child's session."""
+    async def test_subagent_events_forward_only_safe_metadata_and_drop_child_text(self, adapter):
+        """The public run stream carries structured child state, never child content."""
         run_id = "run_subagent_redact"
         loop = asyncio.get_running_loop()
-        queue = asyncio.Queue()
+        queue = _RunEventJournal(max_events=10)
+        subscriber = queue.subscribe(after_id=0)
         adapter._run_streams[run_id] = queue
         adapter._run_statuses.pop(run_id, None)
 
         callback = adapter._make_run_event_callback(run_id, loop)
         secret = "sk-proj-abcdef1234567890abcdef1234567890abcdef12"
+        common = {
+            "subagent_id": "deleg_999", "parent_id": "parent_1", "delegation_id": "batch_1",
+            "task_index": 0, "task_count": 2, "depth": 1, "model": "gpt-5",
+        }
+        callback("subagent.spawn_requested", goal=secret, **common)
+        callback("subagent.start", preview=secret, **common)
+        callback("subagent.progress", status="working", summary=secret, **common)
+        callback("subagent.tool", tool_name="terminal", args={"secret": secret}, **common)
+        callback("subagent.thinking", preview=secret, **common)
+        callback("subagent.text", preview=secret, **common)
         callback(
-            "subagent.complete",
-            preview=f"leaked {secret}",
-            goal=f"use key {secret} to fetch data",
-            subagent_id="deleg_999",
-            child_session_id="child-sess-42",
-            status="completed",
-            summary=f"exported OPENAI_API_KEY={secret} then ran",
-            output_tail=f"env shows {secret}",
-        )
+            "subagent.complete", status="completed", duration_seconds=1.25, tool_count=3,
+            summary=secret, output_tail=secret, files_read=[secret], input_tokens=99, **common)
 
-        event = await asyncio.wait_for(queue.get(), timeout=1.0)
-        assert event["child_session_id"] == "child-sess-42"
-        for field in ("preview", "goal", "summary", "output_tail"):
-            assert secret not in event[field], field
+        events = []
+        for _ in range(5):
+            events.append((await asyncio.wait_for(subscriber.get(), timeout=1.0)).event)
+
+        assert [event["event"] for event in events] == [
+            "subagent.spawn_requested", "subagent.start", "subagent.progress",
+            "subagent.tool", "subagent.complete",
+        ]
+        assert events[3]["tool_name"] == "terminal"
+        assert events[-1]["duration_seconds"] == 1.25
+        assert events[-1]["tool_count"] == 3
+        serialized = json.dumps(events)
+        assert secret not in serialized
+        for forbidden in (
+            "preview", "goal", "summary", "output_tail", "args", "files_read", "files_written",
+            "input_tokens", "output_tokens", "reasoning_tokens", "child_session_id"):
+            assert all(forbidden not in event for event in events), forbidden
 
 
 # ---------------------------------------------------------------------------
