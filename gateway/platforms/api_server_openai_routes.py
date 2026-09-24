@@ -206,6 +206,8 @@ class _ResponsesStream:
         self.model, self.created_at, self.conversation_history = model, created_at, conversation_history
         self.user_message, self.instructions = user_message, instructions
         self.conversation, self.store, self.session_id = conversation, store, session_id
+        # Resolved in the request's profile scope: a snapshot written after it (disconnect) must not follow another.
+        self.response_store = adapter._current_response_store()
         self.final_text_parts: List[str] = []
         self.pending_tool_calls: List[Dict[str, Any]] = []  # open function_call items, in order
         self.emitted_items: List[Dict[str, Any]] = []  # output items so far (terminal payload)
@@ -250,13 +252,13 @@ class _ResponsesStream:
     def persist_snapshot(self, response_env: Dict[str, Any], *, history=None, session_id=None):
         if not self.store:
             return
-        self.adapter._response_store.put(self.response_id, {
+        self.response_store.put(self.response_id, {
             "response": response_env,
             "conversation_history": self._history_with_user() if history is None else history,
             "instructions": self.instructions,
             "session_id": session_id or self.session_id})
         if self.conversation:
-            self.adapter._response_store.set_conversation(self.conversation, self.response_id)
+            self.response_store.set_conversation(self.conversation, self.response_id)
 
     def persist_incomplete_if_needed(self) -> None:
         """Persist an ``incomplete`` snapshot when no terminal one was written (disconnect /
@@ -394,19 +396,29 @@ class _ResponsesStream:
         for event in ("response.output_item.added", "response.output_item.done"):
             await self.write_event(event, {"type": event, "output_index": idx, "item": output_item})
 
+    async def emit_status(self, payload: Dict[str, Any]) -> None:
+        """Lifecycle/warning status (provider wait, auto-recovery countdown, fallback switch) as a
+        ``hermes.status`` custom event; not a Responses output item."""
+        await self.response.write(self._api._sse_frame(payload, event="hermes.status"))
+
+    # queue tag -> (method name, payload adapter)
+    _TAG_HANDLERS = {
+        "__tool_started__": ("emit_tool_started", lambda p: p),
+        "__tool_completed__": ("emit_tool_completed", lambda p: p),
+        "__commentary__": ("emit_commentary", lambda p: p["text"]),
+        "__reasoning__": ("emit_reasoning_delta", lambda p: p),
+        "__status__": ("emit_status", lambda p: p),
+    }
+
     async def dispatch(self, item: Any) -> None:
-        """Route one queue item: tool tuples emit immediately, strings are batched, others dropped."""
+        """Route one queue item: tagged tuples emit immediately, strings are batched, others dropped."""
         if isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], str):
             tag, payload = item
             await self.flush_batch()
-            if tag == "__tool_started__":
-                await self.emit_tool_started(payload)
-            elif tag == "__tool_completed__":
-                await self.emit_tool_completed(payload)
-            elif tag == "__commentary__":
-                await self.emit_commentary(payload["text"])
-            elif tag == "__reasoning__":
-                await self.emit_reasoning_delta(payload)
+            handler = self._TAG_HANDLERS.get(tag)
+            if handler is not None:
+                method, adapt = handler
+                await getattr(self, method)(adapt(payload))
         elif isinstance(item, str):
             self._batch_buf.append(item)
             if self._batch_timer is None:
@@ -541,10 +553,17 @@ class OpenAICompatRoutesMixin:
             # keep them distinct from answer text.
             if text:
                 stream_q.put_threadsafe(("__reasoning__", text))
+        def _on_status(kind, message=None):
+            # Lifecycle/warning status (provider wait, auto-recovery countdown, fallback switch) as a
+            # ``hermes.status`` event, so a client sees why the stream is silent instead of a dead socket.
+            from gateway.platforms.api_server import _redact_api_error_text
+            text = _redact_api_error_text(message if message is not None else kind or "").strip()
+            if text:
+                stream_q.put_threadsafe(("__status__", {"kind": str(kind), "text": text}))
         agent_ref = [None]
         agent_task = asyncio.ensure_future(self._run_agent(
-            stream_delta_callback=_on_delta, reasoning_callback=_on_reasoning, agent_ref=agent_ref,
-            **run_kwargs))
+            stream_delta_callback=_on_delta, reasoning_callback=_on_reasoning, status_callback=_on_status,
+            agent_ref=agent_ref, **run_kwargs))
         agent_task.add_done_callback(lambda _fut: stream_q.put_nowait(None))
         return agent_task, agent_ref
 
@@ -823,6 +842,8 @@ class OpenAICompatRoutesMixin:
                     # DeepSeek-style ``delta.reasoning_content`` (#99552), the field Open WebUI,
                     # opencode and the Vercel AI SDK render as a thinking block.
                     await response.write(_sse_frame(_chunk({"reasoning_content": delta[1]})))
+                elif isinstance(delta, tuple) and len(delta) == 2 and delta[0] == "__status__":
+                    await response.write(_sse_frame(delta[1], event="hermes.status"))
                 else:
                     await response.write(_sse_frame(_chunk({"content": delta})))
             # The agent can fail after the queue drains (task raises / result flagged failed or
@@ -954,7 +975,7 @@ class OpenAICompatRoutesMixin:
             return _error_response("Cannot use both 'conversation' and 'previous_response_id'", 400)
         if conversation:
             # A conversation name resolves to its latest response_id (unknown = new conversation).
-            previous_response_id = self._response_store.get_conversation(conversation)
+            previous_response_id = self._current_response_store().get_conversation(conversation)
 
         input_messages: List[Dict[str, Any]] = []
         if isinstance(raw_input, str):
@@ -994,7 +1015,7 @@ class OpenAICompatRoutesMixin:
                 logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
         stored_session_id = None
         if not conversation_history and previous_response_id:
-            stored = self._response_store.get(previous_response_id)
+            stored = self._current_response_store().get(previous_response_id)
             if stored is None:
                 return _error_response(f"Previous response not found: {previous_response_id}", 404)
             conversation_history = list(stored.get("conversation_history", []))
@@ -1094,11 +1115,12 @@ class OpenAICompatRoutesMixin:
             "output": self._extract_output_items(result, start_index=output_start_index),
             "usage": _responses_usage_payload(usage)}
         if store:
-            self._response_store.put(response_id, {
+            response_store = self._current_response_store()
+            response_store.put(response_id, {
                 "response": response_data, "conversation_history": full_history,
                 "instructions": instructions, "session_id": _effective_session_id})
             if conversation:
-                self._response_store.set_conversation(conversation, response_id)
+                response_store.set_conversation(conversation, response_id)
         response_headers = {"X-Hermes-Session-Id": _effective_session_id}
         if gateway_session_key:
             response_headers["X-Hermes-Session-Key"] = gateway_session_key
@@ -1111,7 +1133,7 @@ class OpenAICompatRoutesMixin:
         if auth_err:
             return auth_err
         response_id = request.match_info["response_id"]
-        stored = self._response_store.get(response_id)
+        stored = self._current_response_store().get(response_id)
         if stored is None:
             return _error_response(f"Response not found: {response_id}", 404)
         return web.json_response(stored["response"])
@@ -1123,7 +1145,7 @@ class OpenAICompatRoutesMixin:
         if auth_err:
             return auth_err
         response_id = request.match_info["response_id"]
-        if not self._response_store.delete(response_id):
+        if not self._current_response_store().delete(response_id):
             return _error_response(f"Response not found: {response_id}", 404)
         return web.json_response({"id": response_id, "object": "response", "deleted": True})
 
